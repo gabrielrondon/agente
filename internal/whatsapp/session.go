@@ -108,30 +108,14 @@ func NewRealSender(ctx context.Context, dbPath string) (*RealSender, error) {
 			}
 		}
 	} else {
-		// Session already exists — reconnect and wait for handshake to complete
-		connected := make(chan struct{}, 1)
-		handlerID := client.AddEventHandler(func(evt any) {
-			if _, ok := evt.(*events.Connected); ok {
-				select {
-				case connected <- struct{}{}:
-				default:
-				}
-			}
-		})
-		defer client.RemoveEventHandler(handlerID)
-
+		// Session already exists — reconnect and wait until fully authenticated
 		if err := client.Connect(); err != nil {
 			return nil, fmt.Errorf("reconectar: %w", err)
 		}
-
-		select {
-		case <-connected:
-			fmt.Printf("WhatsApp conectado: %s\n", client.Store.ID.User)
-		case <-ctx.Done():
-			return nil, fmt.Errorf("contexto cancelado aguardando reconexão")
-		case <-time.After(15 * time.Second):
-			return nil, fmt.Errorf("timeout reconectando ao WhatsApp (15s)")
+		if !client.WaitForConnection(20 * time.Second) {
+			return nil, fmt.Errorf("timeout aguardando autenticação WhatsApp (20s)")
 		}
+		fmt.Printf("WhatsApp conectado: %s\n", client.Store.ID.User)
 	}
 
 	return r, nil
