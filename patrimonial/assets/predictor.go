@@ -104,8 +104,10 @@ func (p *Predictor) AssessAsset(ctx context.Context, a Asset, hist []Maintenance
 
 	prompt := fmt.Sprintf(
 		"Hoje é %s. Avalie o ativo:\n%s\n\nHistórico de manutenção:\n%s\n\n"+
-			"Considere: idade do ativo, tempo desde última manutenção, tipo de ativo, "+
-			"padrões de falha comuns. Use assess_asset_risk.",
+			"Considere: idade do ativo, tempo desde última manutenção, tipo de ativo, padrões de falha comuns.\n\n"+
+			"Se gerar procurement_list, use marca e modelo para especificar tecnicamente cada item "+
+			"(ex: tamanho de pneu, código de pastilha, voltagem, capacidade de óleo) "+
+			"e inclua quantidades realistas (ex: 4 pneus para carro, não 1). Use assess_asset_risk.",
 		today, assetJSON, histJSON,
 	)
 
@@ -115,8 +117,10 @@ func (p *Predictor) AssessAsset(ctx context.Context, a Asset, hist []Maintenance
 	}
 
 	_, err := p.claude.ChatWithTools(ctx, claude.ChatRequest{
-		System: "Você é um especialista em gestão de ativos domésticos e manutenção preventiva.",
-		User:   prompt,
+		System: "Você é um especialista em gestão de ativos domésticos e manutenção preventiva. " +
+			"Ao listar itens para compra, sempre use marca e modelo do ativo para determinar " +
+			"especificações técnicas precisas e quantidades corretas.",
+		User: prompt,
 		Tools:  tools,
 	}, func(name string, input json.RawMessage) (string, error) {
 		var r struct {
@@ -167,14 +171,19 @@ func (p *Predictor) ProcurementList(ctx context.Context, asset Asset, issue stri
 
 	prompt := fmt.Sprintf(
 		"Ativo: %s (%s %s)\nProblema/necessidade: %s\n\n"+
-			"Liste todos os materiais e serviços necessários para resolver isso.",
+			"Liste todos os materiais e serviços necessários. "+
+			"Use a marca e modelo para especificar tecnicamente cada item: "+
+			"tamanho exato de pneu, código de pastilha, capacidade de óleo, voltagem, etc. "+
+			"Inclua quantidades corretas (ex: 4 pneus, não 1; 3,5L de óleo, não '1 unid').",
 		asset.Name, asset.Brand, asset.Model, issue,
 	)
 
 	var items []string
 	_, err := p.claude.ChatWithTools(ctx, claude.ChatRequest{
-		System: "Você é um especialista em manutenção residencial e de veículos.",
-		User:   prompt,
+		System: "Você é um especialista em manutenção residencial e de veículos. " +
+			"Sempre especifique itens com a terminologia técnica correta para o modelo informado, " +
+			"incluindo especificações (tamanho, código, capacidade) e quantidades realistas.",
+		User: prompt,
 		Tools:  tools,
 	}, func(name string, input json.RawMessage) (string, error) {
 		var r struct {
