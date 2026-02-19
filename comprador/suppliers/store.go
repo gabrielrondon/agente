@@ -109,6 +109,31 @@ func (s *Store) UpdateRating(id string, rating float64) error {
 	return err
 }
 
+// ByPhone returns the supplier matching a phone number (strips non-digits for comparison).
+func (s *Store) ByPhone(phone string) (*Supplier, error) {
+	all, err := s.List()
+	if err != nil {
+		return nil, err
+	}
+	phone = normalizePhone(phone)
+	for _, sup := range all {
+		if normalizePhone(sup.Phone) == phone {
+			return &sup, nil
+		}
+	}
+	return nil, nil
+}
+
+func normalizePhone(phone string) string {
+	var out []byte
+	for i := 0; i < len(phone); i++ {
+		if phone[i] >= '0' && phone[i] <= '9' {
+			out = append(out, phone[i])
+		}
+	}
+	return string(out)
+}
+
 func scanSuppliers(rows *sql.Rows) ([]Supplier, error) {
 	var result []Supplier
 	for rows.Next() {
@@ -193,6 +218,16 @@ func (qs *QuoteStore) UpdateQuoteResponse(id, response string, price float64) er
 		`UPDATE quotes SET response = ?, price = ?, status = 'received', responded_at = ?
 		 WHERE id = ?`,
 		response, price, time.Now(), id,
+	)
+	return err
+}
+
+// UpdateBySupplier records a response for the most recent pending quote from a supplier.
+func (qs *QuoteStore) UpdateBySupplier(supplierID, response string) error {
+	_, err := qs.db.Exec(
+		`UPDATE quotes SET response = ?, status = 'received', responded_at = ?
+		 WHERE supplier_id = ? AND status = 'pending'`,
+		response, time.Now(), supplierID,
 	)
 	return err
 }

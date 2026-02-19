@@ -14,39 +14,39 @@ import (
 
 // Config holds agent configuration.
 type Config struct {
-	City        string
+	City         string
 	QuoteTimeout time.Duration
-	DryRun      bool
+	DryRun       bool
+	WhatsAppDB   string // path for whatsmeow session DB
 }
 
 // DefaultConfig returns sensible defaults.
 func DefaultConfig() Config {
 	return Config{
-		City:        "local",
+		City:         "local",
 		QuoteTimeout: 30 * time.Minute,
-		DryRun:      true,
+		DryRun:       true,
+		WhatsAppDB:   "data/whatsapp.db",
 	}
 }
 
 // Agent is the main Comprador orchestrator.
 type Agent struct {
-	cfg       Config
-	claude    *claude.Client
-	sender    whatsapp.MessageSender
-	supStore  *suppliers.Store
-	qStore    *suppliers.QuoteStore
-	matcher   *suppliers.Matcher
-	qManager  *QuoteManager
-	memStore  *memory.Store
+	cfg      Config
+	claude   *claude.Client
+	sender   whatsapp.MessageSender
+	supStore *suppliers.Store
+	qStore   *suppliers.QuoteStore
+	matcher  *suppliers.Matcher
+	qManager *QuoteManager
+	memStore *memory.Store
 }
 
 // New creates a new Comprador agent.
+// If cfg.DryRun is false, pass a real whatsapp.MessageSender via WithSender or
+// call NewWithWhatsApp to auto-connect via whatsmeow.
 func New(db *sql.DB, cl *claude.Client, cfg Config) *Agent {
-	var sender whatsapp.MessageSender
-	if cfg.DryRun {
-		sender = whatsapp.NewMockSender()
-	}
-	// In production, sender would be a real WhatsApp client.
+	sender := whatsapp.MessageSender(whatsapp.NewMockSender())
 
 	supStore := suppliers.NewStore(db)
 	qStore := suppliers.NewQuoteStore(db)
@@ -63,6 +63,29 @@ func New(db *sql.DB, cl *claude.Client, cfg Config) *Agent {
 		matcher:  matcher,
 		qManager: qManager,
 		memStore: memStore,
+	}
+}
+
+// SetSender swaps the WhatsApp sender (used to inject the real sender after QR login).
+func (a *Agent) SetSender(s whatsapp.MessageSender) {
+	a.sender = s
+	a.qManager = NewQuoteManager(a.claude, s, a.supStore, a.qStore)
+
+	// Register response handler: when a supplier replies, update the quote in the DB
+	_ = s.Listen(func(from, msg string) {
+		a.handleIncoming(from, msg)
+	})
+}
+
+// handleIncoming matches an incoming WhatsApp message to a supplier quote and records it.
+func (a *Agent) handleIncoming(from, msg string) {
+	sup, err := a.supStore.ByPhone(from)
+	if err != nil || sup == nil {
+		return // unknown sender — ignore
+	}
+	fmt.Printf("\n[WhatsApp recebido] %s (%s):\n%s\n\n", sup.Name, from, msg)
+	if err := a.qStore.UpdateBySupplier(sup.ID, msg); err != nil {
+		fmt.Printf("[erro] ao registrar resposta de %s: %v\n", sup.Name, err)
 	}
 }
 
@@ -127,12 +150,14 @@ func (a *Agent) Quote(ctx context.Context, description string, urgent bool) erro
 
 	if a.cfg.DryRun {
 		fmt.Printf("\n[dry-run] Aguardaria %.0f minutos por respostas.\n", timeout.Minutes())
-		fmt.Println("Em produção, o agente ficaria ouvindo o WhatsApp e consolidaria as respostas.")
+		fmt.Println("Em produção, o agente fica ouvindo o WhatsApp e consolida as respostas automaticamente.")
 		return nil
 	}
 
-	// Step 4: Wait for responses
+	// Step 4: Wait for responses (handler updates DB on arrival)
 	fmt.Printf("Aguardando respostas (timeout: %.0f min)...\n", timeout.Minutes())
+	fmt.Println("Pressione Ctrl+C para encerrar e ver cotações parciais.\n")
+
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		quotes, err := a.qStore.PendingByRequest(req.ID)
@@ -147,12 +172,14 @@ func (a *Agent) Quote(ctx context.Context, description string, urgent bool) erro
 			}
 		}
 
+		fmt.Printf("\r%d/%d respostas recebidas...", received, len(sups))
 		if received == len(sups) {
-			break // all responded
+			fmt.Println()
+			break
 		}
-
-		time.Sleep(30 * time.Second)
+		time.Sleep(10 * time.Second)
 	}
+	fmt.Println()
 
 	// Step 5: Compare quotes
 	quotes, _ := a.qStore.PendingByRequest(req.ID)
@@ -161,6 +188,11 @@ func (a *Agent) Quote(ctx context.Context, description string, urgent bool) erro
 		if q.Status == "received" {
 			received = append(received, q)
 		}
+	}
+
+	if len(received) == 0 {
+		fmt.Println("Nenhuma resposta recebida no período.")
+		return nil
 	}
 
 	comparison, err := a.qManager.CompareQuotes(ctx, req, received)
@@ -208,7 +240,7 @@ func (a *Agent) RepeatLast(ctx context.Context) error {
 	return a.Quote(ctx, last.Description, false)
 }
 
-// AddSupplier adds a new supplier interactively.
+// AddSupplier adds a new supplier.
 func (a *Agent) AddSupplier(sup suppliers.Supplier) error {
 	id, err := a.supStore.Add(sup)
 	if err != nil {

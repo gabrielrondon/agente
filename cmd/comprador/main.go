@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"os"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"github.com/user/agente/comprador/suppliers"
 	"github.com/user/agente/internal/claude"
 	"github.com/user/agente/internal/db"
+	"github.com/user/agente/internal/whatsapp"
 )
 
 func main() {
@@ -23,10 +25,11 @@ func main() {
 
 func rootCmd() *cobra.Command {
 	var (
-		dryRun  bool
-		city    string
-		dbPath  string
-		timeout int
+		dryRun   bool
+		city     string
+		dbPath   string
+		waDBPath string
+		timeout  int
 	)
 
 	root := &cobra.Command{
@@ -42,13 +45,13 @@ func rootCmd() *cobra.Command {
 		},
 	}
 
-	root.PersistentFlags().BoolVar(&dryRun, "dry-run", true, "Modo simulação (não envia WhatsApp real)")
-	root.PersistentFlags().StringVar(&city, "city", "local", "Cidade para filtrar fornecedores")
+	root.PersistentFlags().BoolVar(&dryRun, "dry-run", false, "Simular envio (não manda WhatsApp real)")
+	root.PersistentFlags().StringVar(&city, "city", "Campo Grande", "Cidade para filtrar fornecedores")
 	root.PersistentFlags().StringVar(&dbPath, "db", "data/comprador.db", "Caminho do banco SQLite")
+	root.PersistentFlags().StringVar(&waDBPath, "wa-db", "data/whatsapp.db", "Caminho do banco de sessão WhatsApp")
 	root.PersistentFlags().IntVar(&timeout, "timeout", 30, "Timeout de cotação em minutos")
 
-	// Helper to build agent
-	buildAgent := func(cmd *cobra.Command) (*comprador.Agent, error) {
+	buildAgent := func(cmd *cobra.Command, ctx context.Context) (*comprador.Agent, error) {
 		database, err := db.Open(dbPath)
 		if err != nil {
 			return nil, fmt.Errorf("open db: %w", err)
@@ -63,24 +66,35 @@ func rootCmd() *cobra.Command {
 			City:         city,
 			QuoteTimeout: time.Duration(timeout) * time.Minute,
 			DryRun:       dryRun,
+			WhatsAppDB:   waDBPath,
 		}
 
-		return comprador.New(database, cl, cfg), nil
+		agent := comprador.New(database, cl, cfg)
+
+		if !dryRun {
+			// Connect real WhatsApp (shows QR on first run)
+			realSender, err := whatsapp.NewRealSender(ctx, waDBPath)
+			if err != nil {
+				return nil, fmt.Errorf("whatsapp: %w", err)
+			}
+			agent.SetSender(realSender)
+		}
+
+		return agent, nil
 	}
 
 	// quote command
 	quoteCmd := &cobra.Command{
 		Use:   "quote [descrição]",
-		Short: "Solicita cotação de preço para um item ou lista de itens",
+		Short: "Solicitar cotação de preço para um item ou lista de itens",
 		Args:  cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			urgent, _ := cmd.Flags().GetBool("urgent")
-			agent, err := buildAgent(cmd)
+			agent, err := buildAgent(cmd, cmd.Context())
 			if err != nil {
 				return err
 			}
-			description := strings.Join(args, " ")
-			return agent.Quote(cmd.Context(), description, urgent)
+			return agent.Quote(cmd.Context(), strings.Join(args, " "), urgent)
 		},
 	}
 	quoteCmd.Flags().Bool("urgent", false, "Cotação urgente (timeout 5 min)")
@@ -95,7 +109,7 @@ func rootCmd() *cobra.Command {
 		Use:   "add",
 		Short: "Cadastrar novo fornecedor",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			agent, err := buildAgent(cmd)
+			agent, err := buildAgent(cmd, cmd.Context())
 			if err != nil {
 				return err
 			}
@@ -111,14 +125,13 @@ func rootCmd() *cobra.Command {
 		Use:   "list",
 		Short: "Listar fornecedores ativos",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			agent, err := buildAgent(cmd)
+			agent, err := buildAgent(cmd, cmd.Context())
 			if err != nil {
 				return err
 			}
 			return agent.ListSuppliers()
 		},
 	}
-
 	suppliersCmd.AddCommand(suppliersAddCmd, suppliersListCmd)
 
 	// history command
@@ -127,7 +140,7 @@ func rootCmd() *cobra.Command {
 		Short: "Exibir histórico de compras",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			n, _ := cmd.Flags().GetInt("last")
-			agent, err := buildAgent(cmd)
+			agent, err := buildAgent(cmd, cmd.Context())
 			if err != nil {
 				return err
 			}
@@ -141,7 +154,7 @@ func rootCmd() *cobra.Command {
 		Use:   "repeat",
 		Short: "Repetir a última compra",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			agent, err := buildAgent(cmd)
+			agent, err := buildAgent(cmd, cmd.Context())
 			if err != nil {
 				return err
 			}
@@ -162,7 +175,7 @@ func promptSupplier() (suppliers.Supplier, error) {
 	}
 
 	name := read("Nome do fornecedor: ")
-	phone := read("Telefone (ex: 5511999999999): ")
+	phone := read("Telefone (ex: 5567999990000): ")
 	city := read("Cidade: ")
 	catsRaw := read("Categorias (vírgula): ")
 
