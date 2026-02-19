@@ -1,9 +1,12 @@
 package comprador
 
 import (
+	"bufio"
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/user/agente/comprador/memory"
@@ -19,6 +22,7 @@ type Config struct {
 	DryRun       bool
 	WhatsAppDB   string // path for whatsmeow session DB
 	OwnerPhone   string // if set, sends WhatsApp notification to owner when quotes are ready
+	AutoConfirm  bool   // skip interactive confirmation of parsed items before sending
 }
 
 // DefaultConfig returns sensible defaults.
@@ -107,15 +111,11 @@ func (a *Agent) Quote(ctx context.Context, description string, urgent bool) erro
 	req.Urgent = urgent
 	req.Timeout = timeout
 
-	fmt.Printf("Itens identificados:\n")
-	for _, it := range req.Items {
-		note := ""
-		if it.Note != "" {
-			note = " (" + it.Note + ")"
-		}
-		fmt.Printf("  • %.0f %s de %s%s\n", it.Qty, it.Unit, it.Name, note)
+	// Step 1.5: Confirm items with user (skip if auto-confirm or non-interactive)
+	req, err = a.confirmItems(ctx, req)
+	if err != nil {
+		return fmt.Errorf("confirmar itens: %w", err)
 	}
-	fmt.Println()
 
 	// Step 2: Find matching suppliers
 	itemNames := make([]string, len(req.Items))
@@ -149,6 +149,17 @@ func (a *Agent) Quote(ctx context.Context, description string, urgent bool) erro
 		return fmt.Errorf("enviar cotações: %w", err)
 	}
 
+	// Notify owner that quotes were sent
+	deadline := time.Now().Add(timeout)
+	supNames := make([]string, len(supList))
+	for i, s := range supList {
+		supNames[i] = s.Name
+	}
+	a.notify(fmt.Sprintf(
+		"✅ Cotação enviada!\n\nPedido: %q\nFornecedores: %s\nAguardando respostas até %s.",
+		description, strings.Join(supNames, ", "), deadline.Format("15h04"),
+	))
+
 	if a.cfg.DryRun {
 		fmt.Printf("\n[dry-run] Aguardaria %.0f minutos por respostas.\n", timeout.Minutes())
 		fmt.Println("Em produção, o agente fica ouvindo o WhatsApp e consolida as respostas automaticamente.")
@@ -159,7 +170,6 @@ func (a *Agent) Quote(ctx context.Context, description string, urgent bool) erro
 	fmt.Printf("Aguardando respostas (timeout: %.0f min)...\n", timeout.Minutes())
 	fmt.Println("Pressione Ctrl+C para encerrar e ver cotações parciais.\n")
 
-	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		quotes, err := a.qStore.PendingByRequest(req.ID)
 		if err != nil {
@@ -225,6 +235,61 @@ func (a *Agent) Quote(ctx context.Context, description string, urgent bool) erro
 	})
 
 	return nil
+}
+
+// confirmItems shows parsed items to the user and allows corrections before sending.
+// Skips if AutoConfirm is set or stdin is not a terminal.
+func (a *Agent) confirmItems(ctx context.Context, req *QuoteRequest) (*QuoteRequest, error) {
+	printItems := func(items []ParsedItem) {
+		fmt.Println("Itens identificados:")
+		for _, it := range items {
+			note := ""
+			if it.Note != "" {
+				note = " (" + it.Note + ")"
+			}
+			fmt.Printf("  • %.0f %s de %s%s\n", it.Qty, it.Unit, it.Name, note)
+		}
+		fmt.Println()
+	}
+
+	printItems(req.Items)
+
+	if a.cfg.AutoConfirm || !isInteractive() {
+		return req, nil
+	}
+
+	reader := bufio.NewReader(os.Stdin)
+	for {
+		fmt.Print("Confirma? (Enter para enviar, ou descreva a correção): ")
+		correction, _ := reader.ReadString('\n')
+		correction = strings.TrimSpace(correction)
+
+		if correction == "" {
+			return req, nil
+		}
+
+		// Re-parse with the correction merged into the original description
+		corrected, err := a.qManager.ParseRequest(ctx, req.Description+" — correção: "+correction)
+		if err != nil {
+			return nil, err
+		}
+		corrected.ID = req.ID
+		corrected.Urgent = req.Urgent
+		corrected.Timeout = req.Timeout
+		req = corrected
+
+		fmt.Println()
+		printItems(req.Items)
+	}
+}
+
+// isInteractive returns true when stdin is a real terminal (not a pipe or background job).
+func isInteractive() bool {
+	fi, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
+	return (fi.Mode() & os.ModeCharDevice) != 0
 }
 
 // notify sends a WhatsApp message to the owner if configured.

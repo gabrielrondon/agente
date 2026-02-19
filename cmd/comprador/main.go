@@ -25,12 +25,13 @@ func main() {
 
 func rootCmd() *cobra.Command {
 	var (
-		dryRun     bool
-		city       string
-		dbPath     string
-		waDBPath   string
-		timeout    int
-		ownerPhone string
+		dryRun      bool
+		yes         bool
+		city        string
+		dbPath      string
+		waDBPath    string
+		timeout     int
+		ownerPhone  string
 	)
 
 	root := &cobra.Command{
@@ -47,6 +48,7 @@ func rootCmd() *cobra.Command {
 	}
 
 	root.PersistentFlags().BoolVar(&dryRun, "dry-run", false, "Simular envio (não manda WhatsApp real)")
+	root.PersistentFlags().BoolVarP(&yes, "yes", "y", false, "Confirmar itens automaticamente sem prompt interativo")
 	root.PersistentFlags().StringVar(&city, "city", "Campo Grande", "Cidade para filtrar fornecedores")
 	root.PersistentFlags().StringVar(&dbPath, "db", "data/comprador.db", "Caminho do banco SQLite")
 	root.PersistentFlags().StringVar(&waDBPath, "wa-db", "data/whatsapp.db", "Caminho do banco de sessão WhatsApp")
@@ -76,6 +78,7 @@ func rootCmd() *cobra.Command {
 			DryRun:       dryRun,
 			WhatsAppDB:   waDBPath,
 			OwnerPhone:   owner,
+			AutoConfirm:  yes,
 		}
 
 		agent := comprador.New(database, cl, cfg)
