@@ -157,7 +157,9 @@ func (a *Agent) AddMaintenance(assetID string, rec assets.MaintenanceRecord) err
 }
 
 // Buy triggers the Comprador for a specific asset's needs.
-func (a *Agent) Buy(ctx context.Context, assetID string) error {
+// issue is an optional description of the problem; if empty and the automatic
+// assessment returns no items, the user is prompted interactively.
+func (a *Agent) Buy(ctx context.Context, assetID, issue string) error {
 	asset, err := a.store.Get(assetID)
 	if err != nil || asset == nil {
 		return fmt.Errorf("ativo não encontrado: %s", assetID)
@@ -170,10 +172,12 @@ func (a *Agent) Buy(ctx context.Context, assetID string) error {
 	}
 
 	if len(assessment.ProcureList) == 0 {
-		reader := bufio.NewReader(os.Stdin)
-		fmt.Printf("Nenhum item automático para %s. Descreva o que precisa: ", asset.Name)
-		issue, _ := reader.ReadString('\n')
-		issue = strings.TrimSpace(issue)
+		if issue == "" {
+			reader := bufio.NewReader(os.Stdin)
+			fmt.Printf("Nenhum item automático para %s. Descreva o que precisa: ", asset.Name)
+			issue, _ = reader.ReadString('\n')
+			issue = strings.TrimSpace(issue)
+		}
 
 		items, err := a.predictor.ProcurementList(ctx, *asset, issue)
 		if err != nil {

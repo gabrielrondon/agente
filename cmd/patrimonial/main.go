@@ -143,13 +143,15 @@ func rootCmd() *cobra.Command {
 		Short: "Acionar Comprador para comprar itens necessários para um ativo",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			issue, _ := cmd.Flags().GetString("issue")
 			agent, err := buildAgent()
 			if err != nil {
 				return err
 			}
-			return agent.Buy(cmd.Context(), args[0])
+			return agent.Buy(cmd.Context(), args[0], issue)
 		},
 	}
+	buyCmd.Flags().String("issue", "", "Descreva o problema ou itens necessários (evita prompt interativo)")
 
 	root.AddCommand(addCmd, assetsCmd, statusCmd, alertsCmd, maintenanceCmd, buyCmd)
 	return root
