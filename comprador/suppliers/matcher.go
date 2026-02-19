@@ -120,12 +120,17 @@ func (m *Matcher) Match(ctx context.Context, items []string, city string) ([]Mat
 		supIndex[s.ID] = s
 	}
 
+	seen := make(map[string]bool)
 	var results []MatchResult
 	for _, m := range matchedIDs {
+		if seen[m.SupplierID] {
+			continue
+		}
 		sup, ok := supIndex[m.SupplierID]
 		if !ok {
 			continue
 		}
+		seen[m.SupplierID] = true
 		results = append(results, MatchResult{
 			Supplier: sup,
 			Reason:   m.Reason,
