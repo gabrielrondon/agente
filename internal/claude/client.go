@@ -6,29 +6,37 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/anthropics/anthropic-sdk-go"
-	"github.com/anthropics/anthropic-sdk-go/option"
+	"github.com/openai/openai-go"
+	"github.com/openai/openai-go/option"
+	"github.com/openai/openai-go/packages/param"
+	"github.com/openai/openai-go/shared"
 )
 
-const defaultModel = anthropic.ModelClaudeSonnet4_5_20250929
+const (
+	defaultModel      = "deepseek/deepseek-chat-v3-0324"
+	openRouterBaseURL = "https://openrouter.ai/api/v1"
+)
 
-// Client wraps the Anthropic SDK.
+// Client wraps openai-go pointed at OpenRouter.
 type Client struct {
-	inner anthropic.Client // value, not pointer
-	model anthropic.Model
+	inner openai.Client
+	model string
 }
 
-// New creates a Claude client using ANTHROPIC_API_KEY from env.
+// New creates a Client using OPENROUTER_API_KEY from env.
 func New() (*Client, error) {
-	key := os.Getenv("ANTHROPIC_API_KEY")
+	key := os.Getenv("OPENROUTER_API_KEY")
 	if key == "" {
-		return nil, fmt.Errorf("ANTHROPIC_API_KEY not set")
+		return nil, fmt.Errorf("OPENROUTER_API_KEY not set")
 	}
-	c := anthropic.NewClient(option.WithAPIKey(key))
+	c := openai.NewClient(
+		option.WithAPIKey(key),
+		option.WithBaseURL(openRouterBaseURL),
+	)
 	return &Client{inner: c, model: defaultModel}, nil
 }
 
-// ToolDef defines a Claude tool.
+// ToolDef defines a tool available to the model.
 type ToolDef struct {
 	Name        string
 	Description string
@@ -42,153 +50,108 @@ type ChatRequest struct {
 	Tools  []ToolDef
 }
 
-// Chat sends a message and returns Claude's text response.
+// Chat sends a message and returns the model's text response.
 func (c *Client) Chat(ctx context.Context, req ChatRequest) (string, error) {
-	params := anthropic.MessageNewParams{
-		Model:     c.model,
-		MaxTokens: 4096,
-		Messages: []anthropic.MessageParam{
-			anthropic.NewUserMessage(anthropic.NewTextBlock(req.User)),
-		},
-	}
-
-	if req.System != "" {
-		params.System = []anthropic.TextBlockParam{{Text: req.System}}
-	}
-
-	if len(req.Tools) > 0 {
-		params.Tools = buildTools(req.Tools)
-	}
-
-	msg, err := c.inner.Messages.New(ctx, params)
+	params := c.buildParams(req)
+	resp, err := c.inner.Chat.Completions.New(ctx, params)
 	if err != nil {
-		return "", fmt.Errorf("claude api: %w", err)
+		return "", fmt.Errorf("openrouter api: %w", err)
 	}
-
-	var text string
-	for _, block := range msg.Content {
-		switch b := block.AsAny().(type) {
-		case anthropic.TextBlock:
-			text += b.Text
-		}
+	if len(resp.Choices) == 0 {
+		return "", fmt.Errorf("empty response")
 	}
-	return text, nil
+	return resp.Choices[0].Message.Content, nil
 }
 
-// ChatWithTools performs an agentic loop: calls Claude, executes tools via executor,
-// feeds results back, until stop_reason is end_turn or there are no tool calls.
+// ChatWithTools runs an agentic loop: calls the model, executes tools via
+// executor, feeds results back — until finish_reason is "stop" or no tool calls.
 func (c *Client) ChatWithTools(
 	ctx context.Context,
 	req ChatRequest,
 	executor func(name string, input json.RawMessage) (string, error),
 ) (string, error) {
-	params := anthropic.MessageNewParams{
-		Model:     c.model,
-		MaxTokens: 4096,
-		Messages: []anthropic.MessageParam{
-			anthropic.NewUserMessage(anthropic.NewTextBlock(req.User)),
-		},
-	}
+	params := c.buildParams(req)
 
+	for {
+		resp, err := c.inner.Chat.Completions.New(ctx, params)
+		if err != nil {
+			return "", fmt.Errorf("openrouter api: %w", err)
+		}
+		if len(resp.Choices) == 0 {
+			return "", fmt.Errorf("empty response")
+		}
+
+		choice := resp.Choices[0]
+
+		if choice.FinishReason == "stop" || len(choice.Message.ToolCalls) == 0 {
+			return choice.Message.Content, nil
+		}
+
+		// Append assistant message (with tool calls) back to history
+		params.Messages = append(params.Messages, openai.ChatCompletionMessageParamUnion{
+			OfAssistant: ptr(choice.Message.ToAssistantMessageParam()),
+		})
+
+		// Execute each tool and collect results
+		for _, tc := range choice.Message.ToolCalls {
+			result, err := executor(tc.Function.Name, json.RawMessage(tc.Function.Arguments))
+			content := result
+			if err != nil {
+				content = fmt.Sprintf("error: %s", err)
+			}
+			params.Messages = append(params.Messages,
+				openai.ToolMessage(content, tc.ID),
+			)
+		}
+	}
+}
+
+// buildParams constructs ChatCompletionNewParams from a ChatRequest.
+func (c *Client) buildParams(req ChatRequest) openai.ChatCompletionNewParams {
+	var messages []openai.ChatCompletionMessageParamUnion
 	if req.System != "" {
-		params.System = []anthropic.TextBlockParam{{Text: req.System}}
+		messages = append(messages, openai.SystemMessage(req.System))
+	}
+	messages = append(messages, openai.UserMessage(req.User))
+
+	params := openai.ChatCompletionNewParams{
+		Model:    openai.ChatModel(c.model),
+		Messages: messages,
 	}
 
 	if len(req.Tools) > 0 {
 		params.Tools = buildTools(req.Tools)
 	}
 
-	for {
-		msg, err := c.inner.Messages.New(ctx, params)
-		if err != nil {
-			return "", fmt.Errorf("claude api: %w", err)
-		}
-
-		var text string
-		var toolCalls []anthropic.ToolUseBlock
-
-		for _, block := range msg.Content {
-			switch b := block.AsAny().(type) {
-			case anthropic.TextBlock:
-				text += b.Text
-			case anthropic.ToolUseBlock:
-				toolCalls = append(toolCalls, b)
-			}
-		}
-
-		if msg.StopReason == "end_turn" || len(toolCalls) == 0 {
-			return text, nil
-		}
-
-		// Build assistant turn from the response content
-		assistantBlocks := make([]anthropic.ContentBlockParamUnion, len(msg.Content))
-		for i, block := range msg.Content {
-			switch b := block.AsAny().(type) {
-			case anthropic.TextBlock:
-				assistantBlocks[i] = anthropic.NewTextBlock(b.Text)
-			case anthropic.ToolUseBlock:
-				assistantBlocks[i] = anthropic.NewToolUseBlock(b.ID, b.Input, b.Name)
-			}
-		}
-		params.Messages = append(params.Messages, anthropic.NewAssistantMessage(assistantBlocks...))
-
-		// Execute tools and collect results
-		toolResults := make([]anthropic.ContentBlockParamUnion, 0, len(toolCalls))
-		for _, tc := range toolCalls {
-			inputRaw, _ := json.Marshal(tc.Input)
-			result, err := executor(tc.Name, inputRaw)
-			isError := err != nil
-			if isError {
-				result = fmt.Sprintf("error: %s", err)
-			}
-			toolResults = append(toolResults, anthropic.NewToolResultBlock(tc.ID, result, isError))
-		}
-		params.Messages = append(params.Messages, anthropic.NewUserMessage(toolResults...))
-	}
+	return params
 }
 
-func buildTools(defs []ToolDef) []anthropic.ToolUnionParam {
-	tools := make([]anthropic.ToolUnionParam, len(defs))
+func buildTools(defs []ToolDef) []openai.ChatCompletionToolParam {
+	tools := make([]openai.ChatCompletionToolParam, len(defs))
 	for i, t := range defs {
-		schema := toInputSchema(t.InputSchema)
-		tools[i] = anthropic.ToolUnionParam{
-			OfTool: &anthropic.ToolParam{
+		tools[i] = openai.ChatCompletionToolParam{
+			Type: "function",
+			Function: shared.FunctionDefinitionParam{
 				Name:        t.Name,
-				Description: anthropic.String(t.Description),
-				InputSchema: schema,
+				Description: param.NewOpt(t.Description),
+				Parameters:  toFunctionParameters(t.InputSchema),
 			},
 		}
 	}
 	return tools
 }
 
-func toInputSchema(v any) anthropic.ToolInputSchemaParam {
+func toFunctionParameters(v any) shared.FunctionParameters {
 	if v == nil {
-		return anthropic.ToolInputSchemaParam{Properties: map[string]interface{}{}}
+		return shared.FunctionParameters{"type": "object", "properties": map[string]any{}}
 	}
-
-	// Marshal then unmarshal to normalise to map
 	b, err := json.Marshal(v)
 	if err != nil {
-		return anthropic.ToolInputSchemaParam{Properties: map[string]interface{}{}}
+		return shared.FunctionParameters{"type": "object", "properties": map[string]any{}}
 	}
-	var m map[string]any
-	if err := json.Unmarshal(b, &m); err != nil {
-		return anthropic.ToolInputSchemaParam{Properties: map[string]interface{}{}}
-	}
-
-	props, _ := m["properties"].(map[string]any)
-	var required []string
-	if r, ok := m["required"].([]any); ok {
-		for _, s := range r {
-			if sv, ok := s.(string); ok {
-				required = append(required, sv)
-			}
-		}
-	}
-
-	return anthropic.ToolInputSchemaParam{
-		Properties: props,
-		Required:   required,
-	}
+	var m shared.FunctionParameters
+	_ = json.Unmarshal(b, &m)
+	return m
 }
+
+func ptr[T any](v T) *T { return &v }
