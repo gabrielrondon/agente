@@ -25,11 +25,12 @@ func main() {
 
 func rootCmd() *cobra.Command {
 	var (
-		dryRun   bool
-		city     string
-		dbPath   string
-		waDBPath string
-		timeout  int
+		dryRun     bool
+		city       string
+		dbPath     string
+		waDBPath   string
+		timeout    int
+		ownerPhone string
 	)
 
 	root := &cobra.Command{
@@ -50,6 +51,7 @@ func rootCmd() *cobra.Command {
 	root.PersistentFlags().StringVar(&dbPath, "db", "data/comprador.db", "Caminho do banco SQLite")
 	root.PersistentFlags().StringVar(&waDBPath, "wa-db", "data/whatsapp.db", "Caminho do banco de sessão WhatsApp")
 	root.PersistentFlags().IntVar(&timeout, "timeout", 30, "Timeout de cotação em minutos")
+	root.PersistentFlags().StringVar(&ownerPhone, "owner", "", "Telefone do dono para notificação (ex: 5567999990000). Padrão: env OWNER_PHONE")
 
 	buildAgent := func(cmd *cobra.Command, ctx context.Context) (*comprador.Agent, error) {
 		database, err := db.Open(dbPath)
@@ -62,11 +64,18 @@ func rootCmd() *cobra.Command {
 			return nil, err
 		}
 
+		// Owner phone: flag > env var
+		owner := ownerPhone
+		if owner == "" {
+			owner = viper.GetString("OWNER_PHONE")
+		}
+
 		cfg := comprador.Config{
 			City:         city,
 			QuoteTimeout: time.Duration(timeout) * time.Minute,
 			DryRun:       dryRun,
 			WhatsAppDB:   waDBPath,
+			OwnerPhone:   owner,
 		}
 
 		agent := comprador.New(database, cl, cfg)

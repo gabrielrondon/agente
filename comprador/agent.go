@@ -18,6 +18,7 @@ type Config struct {
 	QuoteTimeout time.Duration
 	DryRun       bool
 	WhatsAppDB   string // path for whatsmeow session DB
+	OwnerPhone   string // if set, sends WhatsApp notification to owner when quotes are ready
 }
 
 // DefaultConfig returns sensible defaults.
@@ -192,6 +193,10 @@ func (a *Agent) Quote(ctx context.Context, description string, urgent bool) erro
 
 	if len(received) == 0 {
 		fmt.Println("Nenhuma resposta recebida no período.")
+		a.notify(fmt.Sprintf(
+			"🛒 Cotação: %q\n\nNenhuma resposta recebida em %.0f minutos.\nFornecedores contactados: %d",
+			description, timeout.Minutes(), len(sups),
+		))
 		return nil
 	}
 
@@ -205,7 +210,13 @@ func (a *Agent) Quote(ctx context.Context, description string, urgent bool) erro
 	fmt.Printf("\nRecomendação: %s\n", comparison.Recommendation)
 	fmt.Printf("Melhor fornecedor: %s | Total estimado: R$ %.2f\n", comparison.BestSupplier, comparison.TotalPrice)
 
-	// Step 6: Save to memory
+	// Step 6: Notify owner
+	a.notify(fmt.Sprintf(
+		"🛒 Cotação: %q\n\n%d/%d fornecedores responderam.\n\n%s\n\nMelhor fornecedor: %s\nTotal estimado: R$ %.2f\n\nRecomendação: %s",
+		description, len(received), len(sups), comparison.Table, comparison.BestSupplier, comparison.TotalPrice, comparison.Recommendation,
+	))
+
+	// Step 7: Save to memory
 	_ = a.memStore.Save(memory.PurchaseRecord{
 		Description:    description,
 		Items:          itemNames,
@@ -214,6 +225,18 @@ func (a *Agent) Quote(ctx context.Context, description string, urgent bool) erro
 	})
 
 	return nil
+}
+
+// notify sends a WhatsApp message to the owner if configured.
+func (a *Agent) notify(msg string) {
+	if a.cfg.OwnerPhone == "" || a.cfg.DryRun {
+		return
+	}
+	if err := a.sender.Send(a.cfg.OwnerPhone, msg); err != nil {
+		fmt.Printf("[notify] erro ao notificar dono: %v\n", err)
+	} else {
+		fmt.Printf("[notify] resumo enviado para %s\n", a.cfg.OwnerPhone)
+	}
 }
 
 // History shows recent purchases.
