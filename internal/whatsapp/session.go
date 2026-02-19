@@ -6,7 +6,9 @@ import (
 	"database/sql/driver"
 	"fmt"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/mdp/qrterminal/v3"
@@ -57,12 +59,18 @@ func init() {
 type RealSender struct {
 	client   *whatsmeow.Client
 	handlers []func(from, msg string)
+	lockFile string
 }
 
 // NewRealSender connects to WhatsApp.
 // On first run it shows a QR code; subsequent runs reuse the saved session.
 // dbPath is the SQLite file for session persistence (e.g. "data/whatsapp.db").
 func NewRealSender(ctx context.Context, dbPath string) (*RealSender, error) {
+	lockFile := strings.TrimSuffix(dbPath, ".db") + ".lock"
+	if err := acquireLock(lockFile); err != nil {
+		return nil, err
+	}
+
 	container, err := sqlstore.New(ctx, "sqlite3", "file:"+dbPath+"?_foreign_keys=on", waLog.Noop)
 	if err != nil {
 		return nil, fmt.Errorf("whatsapp store: %w", err)
@@ -73,7 +81,7 @@ func NewRealSender(ctx context.Context, dbPath string) (*RealSender, error) {
 		return nil, fmt.Errorf("get device: %w", err)
 	}
 
-	r := &RealSender{}
+	r := &RealSender{lockFile: lockFile}
 	client := whatsmeow.NewClient(deviceStore, waLog.Noop)
 	r.client = client
 
@@ -118,6 +126,16 @@ func NewRealSender(ctx context.Context, dbPath string) (*RealSender, error) {
 		fmt.Printf("WhatsApp conectado: %s\n", client.Store.ID.User)
 	}
 
+	// Release lock and disconnect cleanly on SIGINT/SIGTERM
+	go func() {
+		sigs := make(chan os.Signal, 1)
+		signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+		<-sigs
+		r.client.Disconnect()
+		releaseLock(lockFile)
+		os.Exit(0)
+	}()
+
 	return r, nil
 }
 
@@ -143,9 +161,10 @@ func (r *RealSender) Listen(handler func(from, msg string)) error {
 	return nil
 }
 
-// Close disconnects from WhatsApp.
+// Close disconnects from WhatsApp and releases the session lock.
 func (r *RealSender) Close() error {
 	r.client.Disconnect()
+	releaseLock(r.lockFile)
 	return nil
 }
 
@@ -170,6 +189,33 @@ func (r *RealSender) handleEvent(evt any) {
 	from := msg.Info.Sender.User // phone number without @s.whatsapp.net
 	for _, h := range r.handlers {
 		h(from, text)
+	}
+}
+
+// acquireLock creates a PID lock file to prevent concurrent WhatsApp sessions.
+// If a stale lock is found (process no longer exists), it is removed automatically.
+func acquireLock(path string) error {
+	if data, err := os.ReadFile(path); err == nil {
+		var pid int
+		if _, err := fmt.Sscanf(strings.TrimSpace(string(data)), "%d", &pid); err == nil && pid > 0 {
+			if proc, err := os.FindProcess(pid); err == nil {
+				if err := proc.Signal(syscall.Signal(0)); err == nil {
+					return fmt.Errorf(
+						"outra instância do WhatsApp já está rodando (PID %d).\n"+
+							"Aguarde ela terminar ou mate-a com: kill %d", pid, pid)
+				}
+			}
+		}
+		// Stale lock — process no longer alive
+		os.Remove(path)
+	}
+	return os.WriteFile(path, []byte(fmt.Sprintf("%d", os.Getpid())), 0644)
+}
+
+// releaseLock removes the PID lock file.
+func releaseLock(path string) {
+	if path != "" {
+		os.Remove(path)
 	}
 }
 
