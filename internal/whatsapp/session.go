@@ -3,9 +3,11 @@ package whatsapp
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/mdp/qrterminal/v3"
 	"go.mau.fi/whatsmeow"
@@ -18,15 +20,37 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// fkDriver wraps modernc.org/sqlite and enables PRAGMA foreign_keys = ON
+// on every new connection — required by whatsmeow's session store.
+type fkDriver struct{ sqlite.Driver }
+
+func (d *fkDriver) Open(name string) (driver.Conn, error) {
+	conn, err := d.Driver.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	stmt, err := conn.Prepare("PRAGMA foreign_keys = ON")
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	_, err = stmt.Exec(nil)
+	stmt.Close()
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	return conn, nil
+}
+
 func init() {
-	// whatsmeow's sqlstore calls sql.Open("sqlite3", ...) internally.
-	// Register modernc.org/sqlite (no CGO) under that name if not yet registered.
+	// Register modernc.org/sqlite (no CGO) as "sqlite3" for whatsmeow compatibility.
 	for _, d := range sql.Drivers() {
 		if d == "sqlite3" {
 			return
 		}
 	}
-	sql.Register("sqlite3", &sqlite.Driver{})
+	sql.Register("sqlite3", &fkDriver{})
 }
 
 // RealSender implements MessageSender using whatsmeow (real WhatsApp Web).
@@ -84,11 +108,30 @@ func NewRealSender(ctx context.Context, dbPath string) (*RealSender, error) {
 			}
 		}
 	} else {
-		// Session already exists — reconnect
+		// Session already exists — reconnect and wait for handshake to complete
+		connected := make(chan struct{}, 1)
+		handlerID := client.AddEventHandler(func(evt any) {
+			if _, ok := evt.(*events.Connected); ok {
+				select {
+				case connected <- struct{}{}:
+				default:
+				}
+			}
+		})
+		defer client.RemoveEventHandler(handlerID)
+
 		if err := client.Connect(); err != nil {
 			return nil, fmt.Errorf("reconectar: %w", err)
 		}
-		fmt.Printf("WhatsApp conectado: %s\n", client.Store.ID.User)
+
+		select {
+		case <-connected:
+			fmt.Printf("WhatsApp conectado: %s\n", client.Store.ID.User)
+		case <-ctx.Done():
+			return nil, fmt.Errorf("contexto cancelado aguardando reconexão")
+		case <-time.After(15 * time.Second):
+			return nil, fmt.Errorf("timeout reconectando ao WhatsApp (15s)")
+		}
 	}
 
 	return r, nil
