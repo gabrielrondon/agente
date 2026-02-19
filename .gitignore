@@ -1,0 +1,17 @@
+# Build
+bin/
+
+# Config com secrets
+.env
+
+# SQLite runtime
+data/
+
+# macOS
+.DS_Store
+
+# IDE / Claude Code local settings
+.idea/
+.vscode/
+.claude/
+*.swp
